@@ -3,7 +3,7 @@
     <h2>登记焖烧班次</h2>
     <button type="button" class="icon-close" onclick="closeDrawer()" aria-label="关闭">×</button>
   </header>
-  <form class="drawer-body" method="post" action="/shifts/new">
+  <form class="drawer-body" method="post" action="/shifts/new" id="shift-new-form" novalidate>
     <label>炭窑
       <select name="clamp_id" required>
         {% for clamp in clamps %}
@@ -15,18 +15,41 @@
       <input name="started_at" type="datetime-local" />
     </label>
     <label>峰值温度 ℃（可空）
-      <input name="peak_temp_c" type="number" step="0.1" />
+      <input id="shift-peak-input" name="peak_temp_c" type="number" step="0.1" />
     </label>
+    <p class="hint warn" id="shift-peak-error" role="alert" hidden>{{ peak_positive_msg }}</p>
     <label>炭品等级
       <input name="charcoal_grade" value="B" />
     </label>
     <label>备注
       <textarea name="notes" rows="3"></textarea>
     </label>
-    <p class="hint">出炭要求最近班次峰值 ≥ 400℃；本表只登记班次。</p>
+    <p class="hint">峰值可留空；一旦填写须大于 {{ min_recorded_peak }}℃。出炭要求最近班次峰值 ≥ {{ min_peak_for_drawn | round | int }}℃；本表只登记班次。</p>
     <div class="actions">
       <button type="submit">写入时间轴</button>
       <button type="button" class="btn ghost" onclick="closeDrawer()">取消</button>
     </div>
   </form>
+  <script>
+    (function () {
+      var form = document.getElementById('shift-new-form');
+      var input = document.getElementById('shift-peak-input');
+      var error = document.getElementById('shift-peak-error');
+      // 与后台 rules.validate_shift_peak_temp 同一套边界、同一句中文：
+      // 留空放行；填写则必须大于 0。
+      form.addEventListener('submit', function (evt) {
+        var raw = (input.value || '').trim();
+        var bad = false;
+        if (raw !== '') {
+          var v = Number(raw);
+          bad = !Number.isFinite(v) || v <= {{ min_recorded_peak }};
+        }
+        error.hidden = !bad;
+        if (bad) {
+          evt.preventDefault();
+          input.focus();
+        }
+      });
+    })();
+  </script>
 </aside>

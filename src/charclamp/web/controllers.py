@@ -10,8 +10,16 @@ from litestar.response import Redirect, Template
 from sqlalchemy import select
 from sqlalchemy.orm import selectinload
 
-from charclamp.domain.models import BurnShift, Clamp, User
-from charclamp.domain.rules import RuleError, assert_can_set_clamp_status, can_mark_clamp_drawn
+from charclamp.domain.models import BurnShift, Clamp, User, utcnow
+from charclamp.domain.rules import (
+    MIN_PEAK_TEMP_FOR_DRAWN,
+    MIN_RECORDED_PEAK_TEMP,
+    PEAK_TEMP_MUST_BE_POSITIVE_MSG,
+    RuleError,
+    assert_can_set_clamp_status,
+    can_mark_clamp_drawn,
+    validate_shift_peak_temp,
+)
 from charclamp.infra.db import SessionLocal
 from charclamp.infra.security import verify_password
 
@@ -161,6 +169,10 @@ class TimelineController(Controller):
                 "clamps": clamps,
                 "preselect_clamp_id": clamp_id,
                 "user": request.user,
+                # 抽屉与后台写入共用同一套峰值边界（domain.rules），文案不另写一份。
+                "min_peak_for_drawn": MIN_PEAK_TEMP_FOR_DRAWN,
+                "min_recorded_peak": MIN_RECORDED_PEAK_TEMP,
+                "peak_positive_msg": PEAK_TEMP_MUST_BE_POSITIVE_MSG,
             },
         )
 
@@ -202,12 +214,42 @@ class ShiftController(Controller):
     ) -> Redirect:
         if not request.user:
             return Redirect("/login")
-        started_raw = data.get("started_at") or ""
-        started_at = datetime.fromisoformat(started_raw) if started_raw else datetime.utcnow()
+        try:
+            clamp_id = int(data["clamp_id"])
+        except (KeyError, TypeError, ValueError):
+            _set_flash(request, "未选择炭窑，班次没有写入", "error")
+            return Redirect("/")
+        started_raw = (data.get("started_at") or "").strip()
+        if started_raw:
+            try:
+                started_at = datetime.fromisoformat(started_raw)
+            except ValueError:
+                _set_flash(request, "开始时间格式无效，班次没有写入", "error")
+                return Redirect(f"/?clamp_id={clamp_id}")
+        else:
+            started_at = utcnow()
         peak_raw = (data.get("peak_temp_c") or "").strip()
-        peak = float(peak_raw) if peak_raw else None
-        clamp_id = int(data["clamp_id"])
+        if peak_raw:
+            try:
+                peak: float | None = float(peak_raw)
+            except ValueError:
+                _set_flash(request, "峰值温度须为数字（或留空），班次没有写入", "error")
+                return Redirect(f"/?clamp_id={clamp_id}")
+        else:
+            peak = None
+        # 峰值边界：抽屉前端与后台写入守同一套规则（rules.validate_shift_peak_temp）。
+        try:
+            validate_shift_peak_temp(peak)
+        except RuleError as exc:
+            _set_flash(request, str(exc), "error")
+            return Redirect(f"/?clamp_id={clamp_id}")
         async with SessionLocal() as db:
+            clamp = (
+                await db.execute(select(Clamp).where(Clamp.id == clamp_id))
+            ).scalar_one_or_none()
+            if not clamp:
+                _set_flash(request, "所选炭窑不存在，班次没有写入", "error")
+                return Redirect("/")
             shift = BurnShift(
                 clamp_id=clamp_id,
                 started_at=started_at,
@@ -216,10 +258,7 @@ class ShiftController(Controller):
                 notes=(data.get("notes") or "").strip(),
             )
             db.add(shift)
-            clamp = (
-                await db.execute(select(Clamp).where(Clamp.id == clamp_id))
-            ).scalar_one_or_none()
-            if clamp and clamp.status == Clamp.STATUS_STACKED:
+            if clamp.status == Clamp.STATUS_STACKED:
                 clamp.status = Clamp.STATUS_BURNING
             await db.commit()
         _set_flash(request, "焖烧班次已登记", "ok")
@@ -241,10 +280,14 @@ class ClampController(Controller):
             return Redirect("/login")
         new_status = (data.get("status") or "").strip()
         async with SessionLocal() as db:
+            # 行锁串行化同一窑的状态变更：两名管理员几乎同时点「已出炭」时，
+            # 先到的事务提交前，后到的事务在此阻塞；锁释放后读到的已是 drawn，
+            # 由 assert_can_set_clamp_status 用中文挡下，只许一笔成功。
             result = await db.execute(
                 select(Clamp)
                 .where(Clamp.id == clamp_id)
                 .options(selectinload(Clamp.shifts))
+                .with_for_update()
             )
             clamp = result.scalar_one_or_none()
             if not clamp:
@@ -255,5 +298,6 @@ class ClampController(Controller):
                 await db.commit()
                 _set_flash(request, f"窑 {clamp.code} 状态已更新", "ok")
             except RuleError as exc:
+                await db.rollback()
                 _set_flash(request, str(exc), "error")
         return Redirect(f"/?clamp_id={clamp_id}")

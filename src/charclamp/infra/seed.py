@@ -40,6 +40,9 @@ def seed_demo() -> None:
         session.flush()
 
         now = utcnow()
+        # 全场恰好一口「焖烧中」窑（c1）：最近班次峰值 455℃，已达出炭下限，
+        # 两名管理员可据此并发点「已出炭」验证只许一笔成功。
+        # c2 已码窑、尚无班次；c3 已出炭。
         session.add_all(
             [
                 BurnShift(
@@ -48,13 +51,6 @@ def seed_demo() -> None:
                     peak_temp_c=455.0,
                     charcoal_grade="A",
                     notes="峰值已过，可出炭",
-                ),
-                BurnShift(
-                    clamp=c2,
-                    started_at=now - timedelta(hours=3),
-                    peak_temp_c=None,
-                    charcoal_grade="B",
-                    notes="刚点火，未测峰值",
                 ),
                 BurnShift(
                     clamp=c3,
