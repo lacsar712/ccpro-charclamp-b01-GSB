@@ -25,6 +25,15 @@ def seed_demo() -> None:
             worker.password_hash = hash_password("123456")
             worker.role = "worker"
 
+        # 第二名管理员：与 admin 几乎同时点同一口窑的出炭时，只许一笔成功
+        admin2 = session.query(User).filter_by(username="admin2").first()
+        if not admin2:
+            admin2 = User(username="admin2", role="admin", password_hash=hash_password("123456"))
+            session.add(admin2)
+        else:
+            admin2.password_hash = hash_password("123456")
+            admin2.role = "admin"
+
         if session.query(Site).first():
             session.commit()
             return
@@ -33,7 +42,9 @@ def seed_demo() -> None:
         session.add(site)
         session.flush()
 
+        # 恰好一口「焖烧中」窑：最近一班峰值 455℃ 已达标，可直接演示并发点出炭
         c1 = Clamp(site=site, code="坞东-甲", status=Clamp.STATUS_BURNING, wood_species="青冈")
+        # 已码窑：尚未点火、没有任何班次
         c2 = Clamp(site=site, code="坞东-乙", status=Clamp.STATUS_STACKED, wood_species="松木")
         c3 = Clamp(site=site, code="河沿-丙", status=Clamp.STATUS_DRAWN, wood_species="栎木")
         session.add_all([c1, c2, c3])
@@ -48,13 +59,6 @@ def seed_demo() -> None:
                     peak_temp_c=455.0,
                     charcoal_grade="A",
                     notes="峰值已过，可出炭",
-                ),
-                BurnShift(
-                    clamp=c2,
-                    started_at=now - timedelta(hours=3),
-                    peak_temp_c=None,
-                    charcoal_grade="B",
-                    notes="刚点火，未测峰值",
                 ),
                 BurnShift(
                     clamp=c3,

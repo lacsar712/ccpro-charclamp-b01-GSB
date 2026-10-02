@@ -7,11 +7,19 @@ from litestar import Controller, MediaType, Request, get, post
 from litestar.enums import RequestEncodingType
 from litestar.params import Body
 from litestar.response import Redirect, Template
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import selectinload
 
 from charclamp.domain.models import BurnShift, Clamp, User
-from charclamp.domain.rules import RuleError, assert_can_set_clamp_status, can_mark_clamp_drawn
+from charclamp.domain.rules import (
+    ALREADY_DRAWN_MSG,
+    MIN_PEAK_TEMP_FOR_DRAWN,
+    PEAK_POSITIVE_MSG,
+    RuleError,
+    assert_can_set_clamp_status,
+    can_mark_clamp_drawn,
+    parse_shift_peak_temp,
+)
 from charclamp.infra.db import SessionLocal
 from charclamp.infra.security import verify_password
 
@@ -160,6 +168,9 @@ class TimelineController(Controller):
             context={
                 "clamps": clamps,
                 "preselect_clamp_id": clamp_id,
+                # 抽屉提示与后台写入取同一条边界、同一句中文
+                "peak_positive_msg": PEAK_POSITIVE_MSG,
+                "min_peak_for_drawn": MIN_PEAK_TEMP_FOR_DRAWN,
                 "user": request.user,
             },
         )
@@ -202,12 +213,33 @@ class ShiftController(Controller):
     ) -> Redirect:
         if not request.user:
             return Redirect("/login")
+        try:
+            clamp_id = int(data["clamp_id"])
+        except (KeyError, TypeError, ValueError):
+            _set_flash(request, "请选择炭窑", "error")
+            return Redirect("/")
         started_raw = data.get("started_at") or ""
-        started_at = datetime.fromisoformat(started_raw) if started_raw else datetime.utcnow()
-        peak_raw = (data.get("peak_temp_c") or "").strip()
-        peak = float(peak_raw) if peak_raw else None
-        clamp_id = int(data["clamp_id"])
+        try:
+            started_at = datetime.fromisoformat(started_raw) if started_raw else datetime.utcnow()
+        except ValueError:
+            _set_flash(request, "开始时间格式不正确", "error")
+            return Redirect(f"/?clamp_id={clamp_id}")
+        # 峰值边界与抽屉同一条规则：不填可登记，填写必须 > 0
+        try:
+            peak = parse_shift_peak_temp(data.get("peak_temp_c"))
+        except RuleError as exc:
+            _set_flash(request, str(exc), "error")
+            return Redirect(f"/?clamp_id={clamp_id}")
         async with SessionLocal() as db:
+            # 与出炭接口同一把行锁：登记班次期间，该窑的出炭判定须排队
+            clamp = (
+                await db.execute(
+                    select(Clamp).where(Clamp.id == clamp_id).with_for_update()
+                )
+            ).scalar_one_or_none()
+            if not clamp:
+                _set_flash(request, "所选炭窑不存在", "error")
+                return Redirect("/")
             shift = BurnShift(
                 clamp_id=clamp_id,
                 started_at=started_at,
@@ -216,10 +248,7 @@ class ShiftController(Controller):
                 notes=(data.get("notes") or "").strip(),
             )
             db.add(shift)
-            clamp = (
-                await db.execute(select(Clamp).where(Clamp.id == clamp_id))
-            ).scalar_one_or_none()
-            if clamp and clamp.status == Clamp.STATUS_STACKED:
+            if clamp.status == Clamp.STATUS_STACKED:
                 clamp.status = Clamp.STATUS_BURNING
             await db.commit()
         _set_flash(request, "焖烧班次已登记", "ok")
@@ -241,19 +270,36 @@ class ClampController(Controller):
             return Redirect("/login")
         new_status = (data.get("status") or "").strip()
         async with SessionLocal() as db:
+            # 行锁串行化同一口窑的并发出炭；班次随锁一并读出，规则判定不抢跑
             result = await db.execute(
                 select(Clamp)
                 .where(Clamp.id == clamp_id)
                 .options(selectinload(Clamp.shifts))
+                .with_for_update()
             )
             clamp = result.scalar_one_or_none()
             if not clamp:
                 return Redirect("/")
             try:
                 assert_can_set_clamp_status(clamp, new_status)
-                clamp.status = new_status
+                if new_status == Clamp.STATUS_DRAWN:
+                    # 比较交换：仅当库里仍非「已出炭」时落库。
+                    # 两名管理员同时点，rowcount 只可能有一个为 1。
+                    cas = await db.execute(
+                        update(Clamp)
+                        .where(
+                            Clamp.id == clamp_id,
+                            Clamp.status != Clamp.STATUS_DRAWN,
+                        )
+                        .values(status=Clamp.STATUS_DRAWN)
+                    )
+                    if cas.rowcount != 1:
+                        raise RuleError(ALREADY_DRAWN_MSG)
+                else:
+                    clamp.status = new_status
                 await db.commit()
                 _set_flash(request, f"窑 {clamp.code} 状态已更新", "ok")
             except RuleError as exc:
+                await db.rollback()
                 _set_flash(request, str(exc), "error")
         return Redirect(f"/?clamp_id={clamp_id}")

@@ -52,6 +52,16 @@
       document.getElementById('drawer-root').classList.remove('open');
       document.getElementById('drawer-backdrop').classList.remove('open');
     }
+    // 班次抽屉的峰值边界（与 /shifts/new 同一条规则、同一句中文）。
+    // 抽屉内容由 htmx 注入，函数定义在全局以保证提交时一定可用。
+    function validateShiftPeak(form) {
+      var raw = (form.elements['peak_temp_c'].value || '').trim();
+      var err = form.querySelector('[data-peak-error]');
+      var value = raw === '' ? null : Number(raw);
+      var bad = value !== null && (!Number.isFinite(value) || value <= 0);
+      if (err) err.hidden = !bad;
+      return !bad;
+    }
   </script>
 </body>
 </html>
